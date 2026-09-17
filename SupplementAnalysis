@@ -1,0 +1,912 @@
+##  SUPPLEMENT PRESCRIBING IN BIPOLAR DISORDER                                
+##  A multi-site Nigerian cohort study                                        
+                                                                          
+##  Data file  : BDPharm.xlsx (must be in the working directory)          
+##  R version  : 4.5.3                                                      
+
+##    1. Place BDPharm.xlsx in your working directory                       
+##    2. Run this script from top to bottom                                  
+##    3. All results print to console; tables export as .docx               
+
+##  MULTIPLICITY CORRECTION                                                
+##    Spearman correlations ............. Bonferroni                         
+##    Pairwise persistence comparisons .. Benjamini-Hochberg                
+##    Users vs non-users table .......... Benjamini-Hochberg               
+
+
+# ============================================================================ #
+#  0.  SETUP                                                                   #
+# ============================================================================ #
+
+required_pkgs <- c(
+  "readxl", "dplyr", "tidyr", "purrr", "stringr", "tibble", "forcats",
+  "FNN", "ResourceSelection", "car", "gtsummary", "flextable",
+  "ggplot2", "scales", "ggrepel", "patchwork", "RColorBrewer"
+)
+
+new_pkgs <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
+if (length(new_pkgs) > 0) install.packages(new_pkgs, dependencies = TRUE)
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+if (!file.exists("BDPharm.xlsx")) {
+  stop("BDPharm.xlsx not found in the working directory: ", getwd())
+}
+
+options(scipen = 6, digits = 4)
+set.seed(2024)
+
+theme_supp <- theme_bw(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    plot.subtitle    = element_text(size = 10, colour = "grey40"),
+    strip.background = element_rect(fill = "#FFF3E0"),
+    strip.text       = element_text(face = "bold", size = 12),
+    legend.position  = "bottom",
+    legend.text      = element_text(size = 12),
+    legend.title     = element_text(size = 12, face = "bold"),
+    axis.text.x      = element_text(size = 12),
+    axis.text.y      = element_text(size = 12),
+    axis.title.x     = element_text(size = 13, face = "bold"),
+    axis.title.y     = element_text(size = 13, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+pal2 <- c("No supplement" = "#4A90D9", "Supplement" = "#E67E22")
+pal_persist <- c("Single phase only" = "#6BAED6",
+                 "Two phases"        = "#2171B5",
+                 "All three phases"  = "#08306B")
+
+
+# ============================================================================ #
+#  2.3  DATA IMPORT AND VARIABLE DERIVATION                                    #
+# ============================================================================ #
+
+raw <- readxl::read_excel("BDPharm.xlsx", sheet = "Sheet1",
+                          .name_repair = "minimal")
+cat("Records imported:", nrow(raw), "\n")
+
+df_full <- raw |>
+  rename_with(~ str_trim(str_to_upper(str_replace_all(., "[^A-Za-z0-9]", "_"))) |>
+                str_replace_all("_+", "_") |> str_remove("_$")) |>
+  rename(
+    age = AGE, sex = SEX, height_cm = HEIGHT, weight_kg = WEIGHT,
+    bmi_raw = BMI, education = EDUCATION, work = WORK,
+    marital = MARITAL_STATUS, site = SITE, setting = SETTING,
+    facility = FACILITY,
+    psyc_comorbid = PSYC_COMORBIDITY, med_comorbid = MED_COMORBIDITY,
+    n_ep_mania = MANIA, n_ep_depression = DEPRESSION,
+    n_ep_mixed = MIXED, n_ep_hypomania = HYPOMANIA
+  ) |>
+  mutate(
+    id  = row_number(),
+    sex = factor(sex, levels = 0:1, labels = c("Male", "Female")),
+    education = factor(education, levels = 0:4,
+                       labels = c("None", "Primary", "Secondary",
+                                  "Tertiary", "Postgraduate")),
+    work = factor(work, levels = 0:5,
+                  labels = c("Unemployed", "Self-employed", "Full-time",
+                             "Part-time", "Full-time study", "Other")),
+    marital = factor(marital, levels = 1:5,
+                     labels = c("Single", "Married", "Separated/Divorced",
+                                "Widowed", "Cohabiting")),
+    site = factor(site, levels = 1:10,
+                  labels = c("UPTH", "FNHE", "EKSUTH", "UITH", "FNPH Yaba",
+                             "FNPH Calabar", "FNPH Kaduna", "NPH Aro",
+                             "UMTH", "FNPH Maiduguri")),
+    setting  = factor(setting,  levels = 1:2, labels = c("Urban", "Rural")),
+    facility = factor(facility, levels = 1:2,
+                      labels = c("Psychiatric dept.", "Standalone facility")),
+    psyc_comorbid = factor(psyc_comorbid, levels = 0:4,
+                           labels = c("None", "Anxiety", "Alcohol/Drugs",
+                                      "Personality disorder", "Other")),
+    med_comorbid = factor(med_comorbid, levels = 0:8,
+                          labels = c("None", "Hypertension", "Liver disease",
+                                     "Obesity", "Diabetes", "Cardiac",
+                                     "Infertility", "Sexual dysfunction",
+                                     "Other")),
+
+    # Episode polarity history, 3-year lookback
+    total_episodes_3yr = n_ep_mania + n_ep_depression +
+                         n_ep_mixed + n_ep_hypomania,
+    n_polarity_types   = as.integer(n_ep_mania      > 0) +
+                         as.integer(n_ep_depression > 0) +
+                         as.integer(n_ep_mixed      > 0) +
+                         as.integer(n_ep_hypomania  > 0),
+    polarity_cycling   = as.integer(n_polarity_types >= 2),
+    mixed_history      = as.integer(n_ep_mixed > 0),
+
+    # Predominant polarity; ties resolved Mania > Mixed > Depression > Hypomania
+    predominant_polarity = case_when(
+      n_ep_mania >= n_ep_depression & n_ep_mania >= n_ep_mixed &
+        n_ep_mania >= n_ep_hypomania & n_ep_mania > 0         ~ "Mania",
+      n_ep_mixed >= n_ep_depression & n_ep_mixed >= n_ep_hypomania &
+        n_ep_mixed > 0                                         ~ "Mixed",
+      n_ep_depression >= n_ep_hypomania & n_ep_depression > 0  ~ "Depression",
+      n_ep_hypomania > 0                                       ~ "Hypomania",
+      TRUE                                                     ~ NA_character_
+    ) |> factor(levels = c("Mania", "Mixed", "Depression", "Hypomania")),
+
+    any_psyc_comorbid = as.integer(psyc_comorbid != "None"),
+    any_med_comorbid  = as.integer(med_comorbid  != "None")
+  )
+
+
+# ============================================================================ #
+#  2.4  SUPPLEMENT IDENTIFICATION                                              #
+# ============================================================================ #
+
+SUPP_RE <- regex("supplement|vitamin", ignore_case = TRUE)
+
+is_supp_class <- function(x) {
+  str_detect(as.character(x), SUPP_RE) & !is.na(x) &
+    nchar(trimws(as.character(x))) > 0
+}
+
+all_cols <- names(df_full)
+cls_cols <- all_cols[str_detect(all_cols, "MEDICATION_CLASS")]
+nm_cols  <- all_cols[str_detect(all_cols, "MEDICATION_NAME")]
+
+phase_supp_flag <- function(suffix) {
+  pcols <- cls_cols[str_ends(cls_cols, suffix)]
+  apply(df_full[, pcols], 1, function(r) as.integer(any(is_supp_class(r))))
+}
+
+df_full$supp_acute     <- phase_supp_flag("72")
+df_full$supp_remission <- phase_supp_flag("48")
+df_full$supp_recovery  <- phase_supp_flag("6MONTHS")
+
+df_full$any_supp <- as.integer(df_full$supp_acute | df_full$supp_remission |
+                                 df_full$supp_recovery)
+
+df_full$supp_pattern  <- paste0(df_full$supp_acute, df_full$supp_remission,
+                                df_full$supp_recovery)
+df_full$n_supp_phases <- df_full$supp_acute + df_full$supp_remission +
+                         df_full$supp_recovery
+
+df_full$supp_persistence <- case_when(
+  df_full$supp_pattern == "000"                  ~ "None",
+  df_full$supp_pattern %in% c("100","010","001") ~ "Single phase only",
+  df_full$supp_pattern %in% c("110","101","011") ~ "Two phases",
+  df_full$supp_pattern == "111"                  ~ "All three phases",
+  TRUE                                           ~ "None"
+) |> factor(levels = c("None", "Single phase only",
+                       "Two phases", "All three phases"))
+
+# Supplement names from free-text fields, standardised to canonical categories
+extract_supp_names <- function(suffix) {
+  pcls <- cls_cols[str_ends(cls_cols, suffix)]
+  pnms <- nm_cols[ str_ends(nm_cols,  suffix)]
+  pair_list <- lapply(pcls, function(cc) {
+    nc <- str_replace(cc, "_CLASS_", "_NAME_")
+    if (nc %in% pnms) list(cls = cc, nm = nc) else NULL
+  }) |> purrr::compact()
+  sapply(seq_len(nrow(df_full)), function(i) {
+    row  <- df_full[i, ]
+    hits <- vapply(pair_list, function(p) {
+      if (is_supp_class(row[[p$cls]])) {
+        nv <- trimws(as.character(row[[p$nm]]))
+        if (!is.na(nv) && nchar(nv) > 0 && nv != "NA") nv else "Not recorded"
+      } else NA_character_
+    }, character(1))
+    hits <- hits[!is.na(hits)]
+    if (length(hits) == 0) "" else paste(unique(hits), collapse = "; ")
+  })
+}
+
+df_full$supp_names_acute     <- extract_supp_names("72")
+df_full$supp_names_remission <- extract_supp_names("48")
+df_full$supp_names_recovery  <- extract_supp_names("6MONTHS")
+
+standardise_supp <- function(x) {
+  x <- str_to_lower(str_trim(x))
+  case_when(
+    str_detect(x, "folic|folate")                                ~ "Folic acid",
+    str_detect(x, "b.complex|b complex|meconerve|b12|cobalamin") ~ "B-complex/B12",
+    str_detect(x, "thiamine|b1")                                 ~ "Thiamine (B1)",
+    str_detect(x, "omega|fish oil")                              ~ "Omega-3 fatty acids",
+    str_detect(x, "vitamin e|vit.e")                             ~ "Vitamin E",
+    str_detect(x, "livolin")                                     ~ "Livolin",
+    str_detect(x, "^supplements?$|^vitamins?$|^others?$|not recorded") ~ "Unspecified",
+    nchar(x) == 0                                                ~ NA_character_,
+    TRUE                                                         ~ str_to_title(x)
+  )
+}
+
+supp_name_long <- df_full |>
+  filter(any_supp == 1) |>
+  select(id, supp_names_acute, supp_names_remission, supp_names_recovery) |>
+  pivot_longer(-id, names_to = "phase", values_to = "raw_names") |>
+  mutate(phase = factor(str_replace(phase, "supp_names_", ""),
+                        levels = c("acute", "remission", "recovery"),
+                        labels = c("Acute (<=72h)", "Remission (<=48h)",
+                                   "Recovery (6m)"))) |>
+  filter(nchar(raw_names) > 0) |>
+  separate_rows(raw_names, sep = "; ") |>
+  mutate(supp_std = standardise_supp(raw_names)) |>
+  filter(!is.na(supp_std))
+
+
+# ============================================================================ #
+#  2.6  PHARMACOTHERAPY VARIABLES                                              #
+# ============================================================================ #
+
+is_ap <- function(x) str_detect(as.character(x), regex("antipsychotic",  ignore_case = TRUE)) & !is.na(x)
+is_ms <- function(x) str_detect(as.character(x), regex("mood.stabil",    ignore_case = TRUE)) & !is.na(x)
+is_ad <- function(x) str_detect(as.character(x), regex("antidepressant", ignore_case = TRUE)) & !is.na(x)
+
+build_phase_vars <- function(data, suffix, label) {
+  pcls <- cls_cols[str_ends(cls_cols, suffix)]
+  cm   <- as.data.frame(data[, pcls])
+  data[[paste0("ap_", label)]] <-
+    apply(cm, 1, function(r) as.integer(any(is_ap(r[!is.na(r)]))))
+  data[[paste0("ms_", label)]] <-
+    apply(cm, 1, function(r) as.integer(any(is_ms(r[!is.na(r)]))))
+  data[[paste0("ad_", label)]] <-
+    apply(cm, 1, function(r) as.integer(any(is_ad(r[!is.na(r)]))))
+  data[[paste0("n_psych_", label)]] <-
+    apply(cm, 1, function(r) sum(!is.na(r) & nchar(trimws(as.character(r))) > 0))
+  data[[paste0("poly_", label)]] <-
+    as.integer(data[[paste0("n_psych_", label)]] >= 3)
+  data
+}
+
+df_full <- build_phase_vars(df_full, "72",      "acute")
+df_full <- build_phase_vars(df_full, "48",      "remission")
+df_full <- build_phase_vars(df_full, "6MONTHS", "recovery")
+
+# Index episode: medication prefix stack populated at the acute phase
+get_index_episode <- function(data, suffix = "72") {
+  ep_prefixes <- c(Mania = "MANIA", Depression = "DEP",
+                   Mixed = "MIXED", `Schizoaffective-Mania` = "SCHAFMANIA")
+  slots <- c("A", "B", "C", "D", "E")
+  purrr::pmap_chr(data, function(...) {
+    row <- list(...)
+    counts <- sapply(ep_prefixes, function(pfx) {
+      cols <- paste0(pfx, "_MEDICATION_CLASS_", slots, toupper(suffix))
+      cols <- cols[cols %in% names(row)]
+      sum(sapply(cols, function(c)
+        !is.na(row[[c]]) && nchar(trimws(as.character(row[[c]]))) > 0))
+    })
+    if (max(counts) == 0) return(NA_character_)
+    names(which.max(counts))
+  })
+}
+
+df_full$index_episode <- factor(
+  get_index_episode(df_full, "72"),
+  levels = c("Mania", "Depression", "Mixed", "Schizoaffective-Mania"))
+
+
+# ============================================================================ #
+#  2.2  PARTICIPANT FLOW AND RECORD COMPLETENESS                               #
+# ============================================================================ #
+
+n_screened <- nrow(raw)
+
+df_full <- df_full |>
+  mutate(n_meds_acute = rowSums(
+    across(matches("MEDICATION_CLASS_.*72$"),
+           ~ !is.na(.) & nchar(trimws(as.character(.))) > 0))) |>
+  filter(n_meds_acute > 0)
+
+cat("\n===== PARTICIPANT FLOW (Figure 1) =====\n")
+cat(sprintf("  Records screened      : %d\n", n_screened))
+cat(sprintf("  Excluded, no acute Rx : %d\n", n_screened - nrow(df_full)))
+cat(sprintf("  Analytic sample       : %d\n", nrow(df_full)))
+cat(sprintf("  Supplement cohort     : %d (%.1f%%)\n",
+            sum(df_full$any_supp), 100 * mean(df_full$any_supp)))
+cat(sprintf("  Non-supplement cohort : %d\n", sum(df_full$any_supp == 0)))
+
+cat("\n-- Record completeness by phase --\n")
+print(df_full |> summarise(
+  N                   = n(),
+  acute_evaluable     = sum(n_psych_acute > 0, na.rm = TRUE),
+  remission_evaluable = sum(!is.na(n_psych_remission)),
+  recovery_evaluable  = sum(!is.na(n_psych_recovery)),
+  zero_at_remission   = sum(n_psych_remission == 0, na.rm = TRUE),
+  zero_at_recovery    = sum(n_psych_recovery  == 0, na.rm = TRUE)
+) |> t() |> as.data.frame())
+
+
+# ============================================================================ #
+#  2.5  ANTHROPOMETRICS, KNN IMPUTATION AND ESTIMATED BMR                      #
+# ============================================================================ #
+
+# Heights < 100 cm treated as missing (data-entry error) prior to imputation
+df_full$height_cm_clean <- ifelse(
+  !is.na(df_full$height_cm) & df_full$height_cm < 100,
+  NA_real_, df_full$height_cm)
+
+imp_feats <- df_full |>
+  mutate(sex_n = as.integer(sex), ep_n = n_polarity_types) |>
+  select(age, sex_n, ep_n, total_episodes_3yr) |>
+  as.data.frame()
+
+knn_imp <- function(target, features, k = 5) {
+  obs <- which(!is.na(target)); mis <- which(is.na(target))
+  if (!length(mis)) return(target)
+  fm  <- as.matrix(features)
+  mn  <- apply(fm[obs, , drop = FALSE], 2, min, na.rm = TRUE)
+  rng <- pmax(apply(fm[obs, , drop = FALSE], 2, max, na.rm = TRUE) - mn, 1e-8)
+  fn  <- sweep(sweep(fm, 2, mn, "-"), 2, rng, "/")
+  for (j in seq_len(ncol(fn))) {
+    nj <- is.na(fn[, j]); fn[nj, j] <- mean(fn[obs, j], na.rm = TRUE)
+  }
+  idx <- FNN::knnx.index(fn[obs, , drop = FALSE], fn[mis, , drop = FALSE], k = k)
+  dst <- FNN::knnx.dist( fn[obs, , drop = FALSE], fn[mis, , drop = FALSE], k = k)
+  target[mis] <- sapply(seq_len(nrow(idx)), function(i)
+    weighted.mean(target[obs[idx[i, ]]], 1 / (dst[i, ] + 1e-10), na.rm = TRUE))
+  target
+}
+
+n_miss_height <- sum(is.na(df_full$height_cm_clean))
+n_miss_weight <- sum(is.na(df_full$weight_kg))
+
+df_full$height_imp <- knn_imp(df_full$height_cm_clean, imp_feats)
+df_full$weight_imp <- knn_imp(df_full$weight_kg,       imp_feats)
+
+cat(sprintf("\nHeight imputed: %d -> %d missing\n",
+            n_miss_height, sum(is.na(df_full$height_imp))))
+cat(sprintf("Weight imputed: %d -> %d missing\n",
+            n_miss_weight, sum(is.na(df_full$weight_imp))))
+
+df_full <- df_full |>
+  mutate(
+    bmi_imp = ifelse(is.na(bmi_raw) | bmi_raw > 60 | bmi_raw < 12,
+                     weight_imp / (height_imp / 100)^2, bmi_raw),
+    # Mifflin-St Jeor equation, sex-specific
+    bmr = case_when(
+      sex == "Male"   ~ 10 * weight_imp + 6.25 * height_imp - 5 * age + 5,
+      sex == "Female" ~ 10 * weight_imp + 6.25 * height_imp - 5 * age - 161,
+      TRUE ~ NA_real_),
+    # Sex-pooled tertiles, reported in Table 1 only
+    bmr_cat = cut(bmr, breaks = quantile(bmr, c(0, 1/3, 2/3, 1), na.rm = TRUE),
+                  labels = c("Low", "Moderate", "High"), include.lowest = TRUE)
+  )
+
+df_supp   <- df_full |> filter(any_supp == 1)
+df_nosupp <- df_full |> filter(any_supp == 0)
+
+
+# ============================================================================ #
+#  3.2  IMPUTATION SENSITIVITY ANALYSIS                                        #
+# ============================================================================ #
+
+df_full <- df_full |>
+  mutate(complete_anthro = as.integer(!is.na(height_cm) & !is.na(weight_kg)))
+
+cat(sprintf("\n===== IMPUTATION SENSITIVITY =====\nComplete cases: %d (%.1f%%)\n",
+            sum(df_full$complete_anthro), 100 * mean(df_full$complete_anthro)))
+
+cat("\n-- Missingness vs supplement status --\n")
+miss_tab <- table(
+  Anthropometry = factor(df_full$complete_anthro,
+                         labels = c("Imputed", "Observed")),
+  Supplement    = factor(df_full$any_supp, labels = c("No", "Yes")))
+print(miss_tab)
+print(chisq.test(miss_tab))
+
+cat("\n-- Supplementary Table 2. Observed versus imputed cases --\n")
+miss_compare <- df_full |>
+  mutate(Group = factor(complete_anthro, levels = c(0, 1),
+                        labels = c("Imputed", "Observed"))) |>
+  select(Group, age, sex, total_episodes_3yr, n_psych_acute,
+         any_psyc_comorbid, any_med_comorbid) |>
+  tbl_summary(by = Group,
+              statistic = list(all_continuous()  ~ "{median} [{p25}, {p75}]",
+                               all_categorical() ~ "{n} ({p}%)"),
+              type = list(age ~ "continuous",
+                          total_episodes_3yr ~ "continuous",
+                          n_psych_acute ~ "continuous"),
+              missing = "no") |>
+  add_p(test = list(all_continuous()  ~ "wilcox.test",
+                    all_categorical() ~ "chisq.test")) |>
+  bold_p() |>
+  modify_caption("**Supplementary Table 2. Observed versus imputed anthropometric cases**")
+print(miss_compare)
+
+# Complete-case replication of the primary BMR comparison
+df_cc <- df_full |> filter(complete_anthro == 1)
+w_cc  <- wilcox.test(bmr ~ any_supp, data = df_cc, exact = FALSE)
+g1 <- df_cc$bmr[df_cc$any_supp == 1]
+g0 <- df_cc$bmr[df_cc$any_supp == 0]
+d_cc  <- mean(g1, na.rm = TRUE) - mean(g0, na.rm = TRUE)
+se_cc <- sqrt(var(g1, na.rm = TRUE) / sum(!is.na(g1)) +
+              var(g0, na.rm = TRUE) / sum(!is.na(g0)))
+
+cat(sprintf("\n-- Complete-case BMR comparison (n = %d) --\n", nrow(df_cc)))
+cat(sprintf("  Mean difference = %.1f kcal/day, 95%% CI [%.1f, %.1f], p = %.4f\n",
+            d_cc, d_cc - 1.96 * se_cc, d_cc + 1.96 * se_cc, w_cc$p.value))
+
+lm_cc <- lm(bmr ~ any_supp + age + sex + total_episodes_3yr +
+              n_psych_acute + any_psyc_comorbid + any_med_comorbid,
+            data = df_cc)
+cat("\n-- Complete-case adjusted model --\n")
+print(round(cbind(Beta = coef(lm_cc), confint(lm_cc)), 2))
+
+
+# ============================================================================ #
+#  3.1  TABLE 1 — SUPPLEMENT COHORT CHARACTERISTICS                            #
+# ============================================================================ #
+
+tbl1 <- df_supp |>
+  select(age, sex, height_imp, weight_imp, bmr,
+         total_episodes_3yr, n_polarity_types, polarity_cycling, mixed_history,
+         n_ep_mania, n_ep_depression, n_ep_mixed,
+         psyc_comorbid, med_comorbid, supp_persistence,
+         ap_acute, ms_acute, n_psych_acute, poly_acute,
+         ap_recovery, ms_recovery, n_psych_recovery, poly_recovery, bmr_cat) |>
+  tbl_summary(
+    statistic = list(all_continuous()  ~ "{mean} ({sd}) [{min}-{max}]",
+                     all_categorical() ~ "{n} ({p}%)"),
+    label = list(
+      age ~ "Age (years)", sex ~ "Sex",
+      height_imp ~ "Height (cm, imputed)",
+      weight_imp ~ "Weight (kg, imputed)",
+      bmr ~ "Estimated BMR (kcal/day)",
+      total_episodes_3yr ~ "Total episodes, 3 years",
+      n_polarity_types ~ "Distinct polarity types (n)",
+      polarity_cycling ~ "Polarity cycling (>=2 types)",
+      mixed_history ~ "Mixed episode history",
+      n_ep_mania ~ "Manic episodes, 3-year count",
+      n_ep_depression ~ "Depressive episodes, 3-year count",
+      n_ep_mixed ~ "Mixed episodes, 3-year count",
+      psyc_comorbid ~ "Psychiatric comorbidity",
+      med_comorbid ~ "Medical comorbidity",
+      supp_persistence ~ "Supplement persistence across phases",
+      ap_acute ~ "AP, acute phase", ms_acute ~ "MS, acute phase",
+      n_psych_acute ~ "Psychotropic count, acute",
+      poly_acute ~ "Polypharmacy (>=3), acute",
+      ap_recovery ~ "AP, recovery phase", ms_recovery ~ "MS, recovery phase",
+      n_psych_recovery ~ "Psychotropic count, recovery",
+      poly_recovery ~ "Polypharmacy (>=3), recovery",
+      bmr_cat ~ "Estimated BMR tertile"),
+    missing_text = "Missing") |>
+  bold_labels() |>
+  modify_caption("**Table 1. Characteristics of the supplement cohort (N = {N})**")
+print(tbl1)
+
+
+# ============================================================================ #
+#  3.1  SUPPLEMENT PERSISTENCE ACROSS PHASES                                   #
+# ============================================================================ #
+
+persistence_tbl <- df_supp |>
+  count(supp_persistence, supp_pattern) |>
+  mutate(pct = round(100 * n / nrow(df_supp), 1),
+         Pattern = recode(supp_pattern,
+           "100" = "Acute only",           "010" = "Remission only",
+           "001" = "Recovery only",        "110" = "Acute + Remission",
+           "101" = "Acute + Recovery",     "011" = "Remission + Recovery",
+           "111" = "All three phases")) |>
+  select(supp_persistence, Pattern, n, pct)
+
+cat("\n-- Supplement persistence patterns --\n")
+print(persistence_tbl)
+
+cochran_q <- function(mat) {
+  mat <- as.matrix(mat); k <- ncol(mat)
+  L <- rowSums(mat); C <- colSums(mat)
+  Q <- ((k - 1) * (k * sum(C^2) - sum(C)^2)) / (k * sum(L) - sum(L^2))
+  list(Q = Q, df = k - 1, p = pchisq(Q, df = k - 1, lower.tail = FALSE))
+}
+
+cq_s <- cochran_q(df_full |> select(supp_acute, supp_remission, supp_recovery))
+cat(sprintf("\nCochran's Q (supplement use, 3 phases): Q(%d) = %.3f, p = %.4f\n",
+            cq_s$df, cq_s$Q, cq_s$p))
+
+mc_supp <- mcnemar.test(table(df_full$supp_acute, df_full$supp_recovery),
+                        correct = TRUE)
+cat(sprintf("McNemar (acute vs recovery): chi2 = %.3f, p = %.4f\n",
+            mc_supp$statistic, mc_supp$p.value))
+
+
+# ============================================================================ #
+#  3.3  TABLE 2 — SUPPLEMENT FREQUENCY                                         #
+# ============================================================================ #
+
+supp_overall <- supp_name_long |>
+  distinct(id, supp_std) |>
+  count(supp_std, name = "n_patients") |>
+  mutate(pct = round(100 * n_patients / nrow(df_supp), 1)) |>
+  arrange(desc(n_patients))
+
+cat("\n-- Table 2. Supplement frequency, unique patients --\n")
+print(supp_overall)
+
+supp_by_phase <- supp_name_long |>
+  count(phase, supp_std, name = "n") |>
+  pivot_wider(names_from = phase, values_from = n, values_fill = 0L) |>
+  rename(Supplement = supp_std)
+
+cat("\n-- Table 2. Supplement frequency by phase --\n")
+print(supp_by_phase)
+
+
+# ============================================================================ #
+#  3.1  SUPPLEMENTARY TABLE 1 — USERS vs NON-USERS                             #
+# ============================================================================ #
+
+tblS1 <- df_full |>
+  mutate(
+    Supplement = factor(any_supp, levels = c(0, 1),
+                        labels = c("No supplement", "Supplement")),
+    polarity_cycling_f = factor(polarity_cycling, levels = c(0, 1),
+                                labels = c("Single polarity", "Cycling")),
+    mixed_history_f = factor(mixed_history, levels = c(0, 1),
+                             labels = c("No", "Yes"))) |>
+  select(Supplement, age, sex, education, work, marital, setting, facility,
+         height_imp, weight_imp, bmi_imp, bmr,
+         n_ep_mania, n_ep_depression, n_ep_mixed, n_ep_hypomania,
+         total_episodes_3yr, n_polarity_types,
+         polarity_cycling_f, mixed_history_f, predominant_polarity,
+         index_episode, psyc_comorbid, med_comorbid) |>
+  tbl_summary(
+    by = Supplement,
+    statistic = list(all_continuous()  ~ "{median} [{p25}, {p75}]",
+                     all_categorical() ~ "{n} ({p}%)"),
+    label = list(
+      age ~ "Age (years)", sex ~ "Sex", education ~ "Education",
+      work ~ "Employment", marital ~ "Marital status",
+      setting ~ "Residence", facility ~ "Facility type",
+      height_imp ~ "Height (cm)", weight_imp ~ "Weight (kg)",
+      bmi_imp ~ "BMI (kg/m2)", bmr ~ "Estimated BMR (kcal/day)",
+      n_ep_mania ~ "Manic episodes, 3-year count",
+      n_ep_depression ~ "Depressive episodes, 3-year count",
+      n_ep_mixed ~ "Mixed episodes, 3-year count",
+      n_ep_hypomania ~ "Hypomanic episodes, 3-year count",
+      total_episodes_3yr ~ "Total episodes, 3 years",
+      n_polarity_types ~ "Distinct polarity types (n)",
+      polarity_cycling_f ~ "Polarity cycling",
+      mixed_history_f ~ "Mixed episode history",
+      predominant_polarity ~ "Predominant polarity",
+      index_episode ~ "Index episode polarity",
+      psyc_comorbid ~ "Psychiatric comorbidity",
+      med_comorbid ~ "Medical comorbidity")) |>
+  add_p(test = list(all_continuous()  ~ "wilcox.test",
+                    all_categorical() ~ "chisq.test")) |>
+  add_q(method = "BH") |>
+  add_overall() |>
+  bold_p(t = 0.05, q = TRUE) |>
+  bold_labels() |>
+  modify_caption("**Supplementary Table 1. Characteristics of supplement users versus non-users**")
+print(tblS1)
+
+
+# ============================================================================ #
+#  3.4  TABLE 3 — PHARMACOTHERAPY COMPARISON                                   #
+# ============================================================================ #
+
+tbl3 <- df_full |>
+  mutate(Supplement = factor(any_supp,
+                             labels = c("No supplement", "Supplement"))) |>
+  select(Supplement,
+         ap_acute, ms_acute, ad_acute, n_psych_acute, poly_acute,
+         ap_remission, ms_remission, ad_remission, n_psych_remission,
+         poly_remission,
+         ap_recovery, ms_recovery, ad_recovery, n_psych_recovery,
+         poly_recovery) |>
+  tbl_summary(
+    by = Supplement,
+    statistic = list(all_continuous()  ~ "{mean} ({sd})",
+                     all_categorical() ~ "{n} ({p}%)"),
+    label = list(
+      ap_acute ~ "AP, acute", ms_acute ~ "MS, acute", ad_acute ~ "AD, acute",
+      n_psych_acute ~ "N psychotropics, acute",
+      poly_acute ~ "Polypharmacy >=3, acute",
+      ap_remission ~ "AP, remission", ms_remission ~ "MS, remission",
+      ad_remission ~ "AD, remission",
+      n_psych_remission ~ "N psychotropics, remission",
+      poly_remission ~ "Polypharmacy >=3, remission",
+      ap_recovery ~ "AP, recovery", ms_recovery ~ "MS, recovery",
+      ad_recovery ~ "AD, recovery",
+      n_psych_recovery ~ "N psychotropics, recovery",
+      poly_recovery ~ "Polypharmacy >=3, recovery")) |>
+  add_p(test = list(all_continuous()  ~ "wilcox.test",
+                    all_categorical() ~ "chisq.test")) |>
+  bold_p() |>
+  modify_caption("**Table 3. Pharmacotherapy comparison, supplement versus non-supplement users**")
+print(tbl3)
+
+cat("\n-- Kruskal-Wallis: psychotropic count by supplement persistence --\n")
+for (v in c("n_psych_acute", "n_psych_remission", "n_psych_recovery")) {
+  kw <- kruskal.test(as.formula(paste(v, "~ supp_persistence")), data = df_supp)
+  cat(sprintf("  %-18s chi2(%d) = %6.3f, p = %.4f\n",
+              v, kw$parameter, kw$statistic, kw$p.value))
+}
+
+
+# ============================================================================ #
+#  3.4  TABLE 4 — LOGISTIC REGRESSION, PREDICTORS OF SUPPLEMENT USE           #
+# ============================================================================ #
+
+logit_supp <- glm(
+  any_supp ~ ap_acute + ms_acute + ad_acute + n_psych_acute +
+    age + sex + any_psyc_comorbid + any_med_comorbid,
+  data = df_full, family = binomial("logit"))
+
+cat("\n===== LOGISTIC REGRESSION =====\n")
+print(formula(logit_supp))
+cat("All covariates entered simultaneously; no stepwise selection.\n\n")
+print(summary(logit_supp))
+
+cat("\n-- Odds ratios with 95% CI --\n")
+print(round(exp(cbind(OR = coef(logit_supp), confint(logit_supp))), 3))
+
+hl_s <- ResourceSelection::hoslem.test(logit_supp$y, fitted(logit_supp), g = 10)
+cat(sprintf("\nHosmer-Lemeshow: chi2(%d) = %.3f, p = %.4f\n",
+            hl_s$parameter, hl_s$statistic, hl_s$p.value))
+
+cat("\n-- Variance inflation factors --\n")
+print(car::vif(logit_supp))
+
+null_s <- glm(any_supp ~ 1, data = model.frame(logit_supp), family = binomial)
+n_s    <- nrow(model.frame(logit_supp))
+r2_s   <- (1 - exp((2 / n_s) * (logLik(null_s) - logLik(logit_supp)))) /
+          (1 - exp((2 / n_s) * logLik(null_s)))
+cat(sprintf("\nNagelkerke R2 = %.3f\n", r2_s))
+
+cat("\n-- Supplementary Table 3. Box-Tidwell, linearity of the logit --\n")
+bt <- glm(any_supp ~ ap_acute + ms_acute + ad_acute +
+            n_psych_acute + I(n_psych_acute * log(n_psych_acute)) +
+            age + I(age * log(age)) + sex +
+            any_psyc_comorbid + any_med_comorbid,
+          data = df_full |> filter(n_psych_acute > 0, age > 0),
+          family = binomial)
+print(summary(bt)$coefficients[
+  grep("log", rownames(summary(bt)$coefficients)), , drop = FALSE])
+
+cd <- cooks.distance(logit_supp)
+cat(sprintf("\nCook's distance: max = %.3f; n > 4/n = %d; n > 0.5 = %d; n > 1.0 = %d\n",
+            max(cd, na.rm = TRUE), sum(cd > 4 / length(cd), na.rm = TRUE),
+            sum(cd > 0.5, na.rm = TRUE), sum(cd > 1, na.rm = TRUE)))
+
+# Sensitivity analysis: psychotropic count modelled categorically
+df_full <- df_full |>
+  mutate(n_psych_cat = cut(n_psych_acute, breaks = c(0, 2, 3, 4, Inf),
+                           labels = c("1-2", "3", "4", ">=5")))
+
+logit_supp_cat <- glm(
+  any_supp ~ ap_acute + ms_acute + ad_acute + n_psych_cat +
+    age + sex + any_psyc_comorbid + any_med_comorbid,
+  data = df_full, family = binomial("logit"))
+
+cat("\n-- Supplementary Table 4. Psychotropic count modelled categorically --\n")
+print(round(exp(cbind(OR = coef(logit_supp_cat),
+                      confint(logit_supp_cat))), 3))
+
+
+# ============================================================================ #
+#  3.5  SUPPLEMENTS AND ESTIMATED BMR                                          #
+# ============================================================================ #
+
+cat("\n===== ESTIMATED BMR BY SUPPLEMENT STATUS =====\n")
+print(df_full |>
+        group_by(Supplement = factor(any_supp, labels = c("No", "Yes")), sex) |>
+        summarise(n = sum(!is.na(bmr)), mean = mean(bmr, na.rm = TRUE),
+                  sd = sd(bmr, na.rm = TRUE), median = median(bmr, na.rm = TRUE),
+                  IQR = IQR(bmr, na.rm = TRUE), .groups = "drop"))
+
+w_bmr <- wilcox.test(bmr ~ any_supp, data = df_full, exact = FALSE)
+n_bmr <- sum(!is.na(df_full$bmr))
+r_bmr <- abs(qnorm(w_bmr$p.value / 2)) / sqrt(n_bmr)
+cat(sprintf("\nWilcoxon (supplement vs non): W = %.0f, p = %.4f, r = %.3f\n",
+            w_bmr$statistic, w_bmr$p.value, r_bmr))
+
+for (sx in c("Male", "Female")) {
+  wt <- wilcox.test(bmr ~ any_supp, data = df_full |> filter(sex == sx),
+                    exact = FALSE)
+  cat(sprintf("  %-7s W = %.0f, p = %.4f\n", sx, wt$statistic, wt$p.value))
+}
+
+kw_pers <- kruskal.test(bmr ~ supp_persistence, data = df_supp)
+cat(sprintf("\nKruskal-Wallis (BMR by persistence): chi2(%d) = %.3f, p = %.4f\n",
+            kw_pers$parameter, kw_pers$statistic, kw_pers$p.value))
+
+pairs_pers <- list(c("Single phase only", "Two phases"),
+                   c("Single phase only", "All three phases"),
+                   c("Two phases",        "All three phases"))
+
+pairwise_es <- purrr::map_dfr(pairs_pers, function(pr) {
+  g1 <- df_supp$bmr[df_supp$supp_persistence == pr[1] & !is.na(df_supp$bmr)]
+  g2 <- df_supp$bmr[df_supp$supp_persistence == pr[2] & !is.na(df_supp$bmr)]
+  wt <- wilcox.test(g1, g2, exact = FALSE)
+  n1 <- length(g1); n2 <- length(g2)
+  sp <- sqrt(((n1 - 1) * var(g1) + (n2 - 1) * var(g2)) / (n1 + n2 - 2))
+  md <- mean(g1) - mean(g2)
+  se <- sp * sqrt(1 / n1 + 1 / n2)
+  data.frame(Comparison = paste(pr[1], "vs", pr[2]), n1 = n1, n2 = n2,
+             mean_diff = round(md, 1),
+             CI_low  = round(md - 1.96 * se, 1),
+             CI_high = round(md + 1.96 * se, 1),
+             cohens_d = round(md / sp, 3),
+             rank_biserial = round(abs(1 - (2 * wt$statistic) / (n1 * n2)), 3),
+             p.value = round(wt$p.value, 4))
+})
+pairwise_es$p.BH <- round(p.adjust(pairwise_es$p.value, "BH"), 4)
+cat("\n-- Pairwise persistence comparisons (BH-corrected) --\n")
+print(pairwise_es)
+
+# Persistence adjusted for group composition
+df_supp <- df_supp |>
+  mutate(persist3 = as.integer(supp_persistence == "All three phases"))
+
+lm_persist_adj <- lm(bmr ~ persist3 + sex + bmi_imp + age +
+                       total_episodes_3yr + n_psych_acute, data = df_supp)
+
+cat("\n-- Persistence adjusted for sex, BMI, age, burden, drug count --\n")
+print(summary(lm_persist_adj))
+print(round(cbind(Beta = coef(lm_persist_adj), confint(lm_persist_adj)), 2))
+
+cat("\n-- Sex composition by persistence group (%) --\n")
+print(round(prop.table(table(df_supp$supp_persistence, df_supp$sex), 1) * 100, 1))
+
+# Folic acid subgroup (exploratory)
+df_full$has_folic <- as.integer(str_detect(
+  paste(df_full$supp_names_acute, df_full$supp_names_remission,
+        df_full$supp_names_recovery),
+  regex("folic|folate", ignore_case = TRUE)))
+
+fa <- wilcox.test(bmr ~ has_folic, data = df_full, exact = FALSE)
+cat(sprintf("\nFolic acid vs non-users (BMR): W = %.0f, p = %.4f\n",
+            fa$statistic, fa$p.value))
+
+# Adjusted linear models
+lm_bmr <- lm(bmr ~ any_supp + age + sex + total_episodes_3yr +
+               n_psych_acute + psyc_comorbid + med_comorbid, data = df_full)
+cat("\n-- BMR ~ supplement use + covariates (full cohort) --\n")
+print(summary(lm_bmr))
+
+lm_bmr_supp <- lm(bmr ~ n_supp_phases + age + sex + total_episodes_3yr +
+                    n_psych_acute, data = df_supp)
+cat("\n-- BMR ~ n supplement phases (supplement cohort) --\n")
+print(summary(lm_bmr_supp))
+
+
+# ============================================================================ #
+#  3.6  ESTIMATED BMR AND ILLNESS-HISTORY / TREATMENT-COMPLEXITY PROXIES      #
+#       Correction method: BONFERRONI                                          #
+# ============================================================================ #
+
+proxy_vars <- c("total_episodes_3yr", "n_polarity_types",
+                "n_ep_mania", "n_ep_mixed", "n_psych_acute")
+proxy_labs <- c("Total episodes (3yr)", "Polarity types (n)",
+                "Manic episodes (3yr)", "Mixed episodes (3yr)",
+                "Psychotropic count (acute)")
+
+run_cors <- function(dat, label) {
+  out <- purrr::map2_dfr(proxy_vars, proxy_labs, function(v, lbl) {
+    sub <- dat |> filter(!is.na(bmr), !is.na(.data[[v]]))
+    ct  <- cor.test(sub$bmr, sub[[v]], method = "spearman", exact = FALSE)
+    data.frame(Cohort = label, Proxy = lbl, n = nrow(sub),
+               rho = round(ct$estimate, 3), p = round(ct$p.value, 4))
+  })
+  out$p.adj <- round(p.adjust(out$p, "bonferroni"), 4)
+  out
+}
+
+cat("\n===== SPEARMAN CORRELATIONS (Bonferroni-corrected) =====\n")
+print(run_cors(df_full,   "Full cohort"))
+print(run_cors(df_supp,   "Supplement"))
+print(run_cors(df_nosupp, "Non-supplement"))
+
+mod_reg <- purrr::map_dfr(proxy_vars[1:4], function(sv) {
+  sub <- df_full |> filter(!is.na(bmr), !is.na(.data[[sv]])) |>
+    mutate(bmr_c = scale(bmr)[, 1])
+  fit <- lm(as.formula(paste(sv,
+    "~ bmr_c * any_supp + age + sex + psyc_comorbid + med_comorbid")),
+    data = sub)
+  cf <- coef(summary(fit))
+  ir <- cf[grepl("bmr_c:any_supp", rownames(cf)), , drop = FALSE]
+  if (nrow(ir) == 0) return(NULL)
+  data.frame(Outcome = sv, Beta = round(ir[1, 1], 3), SE = round(ir[1, 2], 3),
+             t = round(ir[1, 3], 3), p = round(ir[1, 4], 4),
+             R2_adj = round(summary(fit)$adj.r.squared, 3))
+})
+
+cat("\n-- Moderated regression: supplement x BMR interaction --\n")
+print(mod_reg)
+
+
+# ============================================================================ #
+#  FIGURES                                                                     #
+# ============================================================================ #
+
+# Figure 2 — supplement persistence pattern
+fig2 <- persistence_tbl |>
+  mutate(Pattern = fct_inorder(Pattern)) |>
+  ggplot(aes(x = n, y = reorder(Pattern, n), fill = supp_persistence)) +
+  geom_col(width = 0.6, alpha = 0.88) +
+  geom_text(aes(label = paste0(n, " (", pct, "%)")), hjust = -0.1, size = 3.5) +
+  scale_fill_manual(values = c("None" = "#C6DBEF", pal_persist)) +
+  scale_x_continuous(limits = c(0, 30)) +
+  labs(title = "Figure 2. Supplement persistence across clinical phases",
+       subtitle = "Pattern: acute - remission - recovery",
+       x = "Number of patients", y = NULL, fill = "Persistence") +
+  theme_supp
+print(fig2)
+
+# Figure 3A — estimated BMR by supplement status and sex
+fig3a <- df_full |>
+  filter(!is.na(bmr)) |>
+  mutate(Group = factor(any_supp,
+                        labels = c("No supplement", "Supplement"))) |>
+  ggplot(aes(x = Group, y = bmr, fill = Group)) +
+  geom_violin(alpha = 0.55, trim = FALSE) +
+  geom_boxplot(width = 0.18, outlier.shape = 21, alpha = 0.85) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3,
+               fill = "white") +
+  facet_wrap(~ sex) +
+  scale_fill_manual(values = pal2) +
+  labs(title = "Figure 3A. Estimated BMR by supplement status and sex",
+       subtitle = "Diamond = mean; box = median/IQR",
+       x = NULL, y = "Estimated BMR (kcal/day)", fill = NULL) +
+  theme_supp
+print(fig3a)
+
+# Figure 3B — estimated BMR by supplement persistence (unadjusted)
+fig3b <- df_supp |>
+  filter(!is.na(bmr)) |>
+  ggplot(aes(x = supp_persistence, y = bmr, fill = supp_persistence)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = 21) +
+  geom_jitter(width = 0.15, size = 1.5, alpha = 0.4) +
+  scale_fill_manual(values = pal_persist) +
+  labs(title = "Figure 3B. Estimated BMR by supplement persistence",
+       subtitle = "Unadjusted; points = individual patients",
+       x = "Supplement persistence", y = "Estimated BMR (kcal/day)",
+       fill = NULL) +
+  theme_supp
+print(fig3b)
+
+# Figure 4 — estimated BMR versus total episode burden by supplement status
+fig4 <- df_full |>
+  filter(!is.na(bmr), !is.na(total_episodes_3yr)) |>
+  mutate(Group = factor(any_supp,
+                        labels = c("No supplement", "Supplement"))) |>
+  ggplot(aes(x = bmr, y = total_episodes_3yr, colour = Group, fill = Group)) +
+  geom_point(alpha = 0.45, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.15, linewidth = 1.1) +
+  scale_colour_manual(values = pal2) +
+  scale_fill_manual(values = pal2) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.08))) +
+  labs(title = "Figure 4. Estimated BMR versus total episode burden",
+       subtitle = "Unadjusted; shaded bands = 95% CI of linear fit",
+       x = "Estimated BMR (kcal/day)", y = "Total episodes (3-year count)",
+       colour = NULL, fill = NULL) +
+  theme_supp
+print(fig4)
+
+
+# ============================================================================ #
+#  EXPORT TABLES AND FIGURES                                                   #
+# ============================================================================ #
+
+if (!dir.exists("output")) dir.create("output")
+
+tbl1   |> as_flex_table() |> flextable::save_as_docx(path = "output/Table1.docx")
+tbl3   |> as_flex_table() |> flextable::save_as_docx(path = "output/Table3.docx")
+tblS1  |> as_flex_table() |> flextable::save_as_docx(path = "output/TableS1.docx")
+miss_compare |> as_flex_table() |>
+  flextable::save_as_docx(path = "output/TableS2.docx")
+
+ggsave("output/Figure2.png",  fig2,  width = 9, height = 6, dpi = 300)
+ggsave("output/Figure3A.png", fig3a, width = 9, height = 6, dpi = 300)
+ggsave("output/Figure3B.png", fig3b, width = 9, height = 7, dpi = 300)
+ggsave("output/Figure4.png",  fig4,  width = 9, height = 6, dpi = 300)
+
+cat("\nTables and figures written to ./output/\n")
+
+
+# ============================================================================ #
+#  SESSION INFORMATION                                                         #
+# ============================================================================ #
+
+cat("\n==============================================================\n")
+cat(sprintf("  Analysis complete. Analytic sample n = %d\n", nrow(df_full)))
+cat(sprintf("  Supplement cohort n = %d\n", nrow(df_supp)))
+cat("  BMR: Mifflin-St Jeor equation, sex-specific\n")
+cat("  Correlations: Bonferroni | Pairwise & Table S1: Benjamini-Hochberg\n")
+cat("==============================================================\n\n")
+
+writeLines(capture.output(sessionInfo()), "output/sessionInfo.txt")
+sessionInfo()
