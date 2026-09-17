@@ -85,8 +85,7 @@ The script is organised by manuscript section:
 
 **Missing data.** Height and weight were imputed using k-nearest neighbour
 smoothing (k = 5) with age, sex, polarity type count and total episode burden
-as predictors, weighted by inverse distance. Heights below 100 cm were treated
-as data-entry errors and imputed. All BMR analyses are repeated in the
+as predictors, weighted by inverse distance. All BMR analyses are repeated in the
 complete-case subgroup as a sensitivity analysis.
 
 **Estimated BMR.** Basal metabolic rate was calculated from the sex-specific
